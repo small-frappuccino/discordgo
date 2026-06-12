@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"image"
 	_ "image/jpeg" // For JPEG decoding
 	_ "image/png"  // For PNG decoding
@@ -313,6 +314,146 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 	}
 
 	return
+}
+
+func (s *Session) requestStreamWithBucketID(method, urlStr string, data interface{}, bucketID string, options ...RequestOption) (io.ReadCloser, error) {
+	var body []byte
+	var err error
+	if data != nil {
+		body, err = Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return s.requestStreamRaw(method, urlStr, "application/json", body, bucketID, 0, options...)
+}
+
+func (s *Session) requestStreamRaw(method, urlStr, contentType string, b []byte, bucketID string, sequence int, options ...RequestOption) (io.ReadCloser, error) {
+	if bucketID == "" {
+		bucketID = strings.SplitN(urlStr, "?", 2)[0]
+	}
+	return s.requestStreamWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucket(bucketID), sequence, options...)
+}
+
+func (s *Session) requestStreamWithLockedBucket(method, urlStr, contentType string, b []byte, bucket *Bucket, sequence int, options ...RequestOption) (io.ReadCloser, error) {
+	if s.Debug {
+		log.Printf("API REQUEST %8s :: %s\n", method, urlStr)
+		log.Printf("API REQUEST  PAYLOAD :: [%s]\n", string(b))
+	}
+
+	req, err := http.NewRequest(method, urlStr, bytes.NewBuffer(b))
+	if err != nil {
+		bucket.Release(nil)
+		return nil, err
+	}
+
+	// Not used on initial login..
+	// TODO: Verify if a login, otherwise complain about no-token
+	if s.Token != "" {
+		req.Header.Set("authorization", s.Token)
+	}
+
+	// Discord's API returns a 400 Bad Request is Content-Type is set, but the
+	// request body is empty.
+	if b != nil {
+		req.Header.Set("Content-Type", contentType)
+	}
+
+	// TODO: Make a configurable static variable.
+	req.Header.Set("User-Agent", s.UserAgent)
+
+	cfg := newRequestConfig(s, req)
+	for _, opt := range options {
+		opt(cfg)
+	}
+	req = cfg.Request
+
+	if s.Debug {
+		for k, v := range req.Header {
+			log.Printf("API REQUEST   HEADER :: [%s] = %+v\n", k, v)
+		}
+	}
+
+	resp, err := cfg.Client.Do(req)
+	if err != nil {
+		bucket.Release(nil)
+		return nil, err
+	}
+
+	err = bucket.Release(resp.Header)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		if s.Debug {
+			log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
+			for k, v := range resp.Header {
+				log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
+			}
+		}
+		return resp.Body, nil
+	}
+
+	defer func() {
+		err2 := resp.Body.Close()
+		if s.Debug && err2 != nil {
+			log.Println("error closing resp body")
+		}
+	}()
+
+	response, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.Debug {
+		log.Printf("API RESPONSE  STATUS :: %s\n", resp.Status)
+		for k, v := range resp.Header {
+			log.Printf("API RESPONSE  HEADER :: [%s] = %+v\n", k, v)
+		}
+		log.Printf("API RESPONSE    BODY :: [%s]\n\n\n", response)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusBadGateway:
+		// Retry sending request if possible
+		if sequence < cfg.MaxRestRetries {
+			s.log(LogInformational, "%s Failed (%s), Retrying...", urlStr, resp.Status)
+			return s.requestStreamWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence+1, options...)
+		}
+		err = fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
+	case http.StatusTooManyRequests:
+		rl := TooManyRequests{}
+		err = Unmarshal(response, &rl)
+		if err != nil {
+			s.log(LogError, "rate limit unmarshal error, %s", err)
+			return nil, err
+		}
+
+		if cfg.ShouldRetryOnRateLimit {
+			s.log(LogInformational, "Rate Limiting %s, retry in %v", urlStr, rl.RetryAfter)
+			s.handleEvent(rateLimitEventType, &RateLimit{TooManyRequests: &rl, URL: urlStr})
+
+			time.Sleep(rl.RetryAfter)
+
+			return s.requestStreamWithLockedBucket(method, urlStr, contentType, b, s.Ratelimiter.LockBucketObject(bucket), sequence, options...)
+		}
+		err = &RateLimitError{&RateLimit{TooManyRequests: &rl, URL: urlStr}}
+	case http.StatusUnauthorized:
+		if strings.Index(s.Token, "Bot ") != 0 {
+			s.log(LogInformational, ErrUnauthorized.Error())
+			err = ErrUnauthorized
+		}
+		fallthrough
+	default: // Error condition
+		err = newRestError(req, resp, response)
+	}
+
+	return nil, err
 }
 
 func unmarshal(data []byte, v interface{}) error {
@@ -819,6 +960,68 @@ func (s *Session) GuildMembers(guildID string, after string, limit int, options 
 		member.GuildID = guildID
 	}
 	return
+}
+
+// GuildMembersSeq returns an iterator for a list of members for a guild.
+// guildID  : The ID of a Guild.
+// after    : The id of the member to return members after
+// limit    : max number of members to return (max 1000)
+func (s *Session) GuildMembersSeq(guildID string, after string, limit int, options ...RequestOption) iter.Seq2[*Member, error] {
+	return func(yield func(*Member, error) bool) {
+		uri := EndpointGuildMembers(guildID)
+
+		v := url.Values{}
+
+		if after != "" {
+			v.Set("after", after)
+		}
+
+		if limit > 0 {
+			v.Set("limit", strconv.Itoa(limit))
+		}
+
+		if len(v) > 0 {
+			uri += "?" + v.Encode()
+		}
+
+		body, err := s.requestStreamWithBucketID("GET", uri, nil, EndpointGuildMembers(guildID), options...)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		defer body.Close()
+
+		dec := json.NewDecoder(body)
+		
+		t, err := dec.Token()
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		if d, ok := t.(json.Delim); !ok || d != '[' {
+			yield(nil, fmt.Errorf("expected '[' at start of response, got %v", t))
+			return
+		}
+
+		for dec.More() {
+			var member *Member
+			err := dec.Decode(&member)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			member.GuildID = guildID
+			if !yield(member, nil) {
+				return
+			}
+		}
+
+		_, err = dec.Token()
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+	}
 }
 
 // GuildMembersSearch returns a list of guild member objects whose username or nickname starts with a provided string
