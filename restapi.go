@@ -15,12 +15,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"iter"
 	"image"
 	_ "image/jpeg" // For JPEG decoding
 	_ "image/png"  // For PNG decoding
 	"io"
 	"io/ioutil"
+	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -992,7 +992,7 @@ func (s *Session) GuildMembersSeq(guildID string, after string, limit int, optio
 		defer body.Close()
 
 		dec := json.NewDecoder(body)
-		
+
 		t, err := dec.Token()
 		if err != nil {
 			yield(nil, err)
