@@ -89,9 +89,10 @@ func (s *Session) Open() error {
 	header.Add("accept-encoding", "zlib")
 	s.wsConn, _, err = s.Dialer.Dial(gateway, header)
 	if err != nil {
-		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
-		s.gateway = "" // clear cached gateway
-		s.wsConn = nil // Just to be safe.
+		s.log(LogError, "error connecting to gateway %s, %s", gateway, err)
+		s.gateway = ""          // clear cached gateway
+		s.resumeGatewayURL = "" // clear resume gateway so next try falls back
+		s.wsConn = nil          // Just to be safe.
 		return err
 	}
 
